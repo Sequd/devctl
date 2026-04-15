@@ -51,6 +51,16 @@ type activeProfileMsg struct {
 	active bool // true = started, false = stopped
 	status string
 }
+type startupScanMsg struct {
+	active map[int]bool // profile index → has running containers
+}
+type confirmMsg struct {
+	question string
+	action   tea.Cmd
+}
+type downAllMsg struct {
+	count int
+}
 
 func (e errMsg) Error() string { return e.err.Error() }
 
@@ -102,6 +112,13 @@ type Model struct {
 
 	// Profile editor
 	editor profileEditor
+
+	// Confirmation dialog
+	confirmQuestion string
+	confirmAction   tea.Cmd
+
+	// Track previously seen service states for notifications
+	prevServiceStates map[string]bool // service name → was running
 }
 
 // New creates a new TUI model.
@@ -114,16 +131,17 @@ func New(cfg *config.Config, dir string, hasConfig bool) Model {
 	ti.Prompt = "> "
 
 	m := Model{
-		cfg:             cfg,
-		dir:             dir,
-		profiles:        cfg.Profiles,
-		selectedProfile: -1,
-		activeProfiles:  make(map[int]bool),
-		launcher:        ti,
-		width:           minWidth,
-		height:          minHeight,
-		hasConfig:       hasConfig,
-		editor:          newProfileEditor(),
+		cfg:               cfg,
+		dir:               dir,
+		profiles:          cfg.Profiles,
+		selectedProfile:   -1,
+		activeProfiles:    make(map[int]bool),
+		launcher:          ti,
+		width:             minWidth,
+		height:            minHeight,
+		hasConfig:         hasConfig,
+		editor:            newProfileEditor(),
+		prevServiceStates: make(map[string]bool),
 	}
 
 	if len(m.profiles) > 0 {
@@ -134,7 +152,7 @@ func New(cfg *config.Config, dir string, hasConfig bool) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{scheduleAutoRefresh()}
+	cmds := []tea.Cmd{scheduleAutoRefresh(), m.scanAllProfiles()}
 	if m.selectedProfile >= 0 {
 		cmds = append(cmds, m.refreshServices())
 	}
@@ -157,6 +175,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case servicesMsg:
 		m.services = []docker.Service(msg)
+		// Detect fallen containers (was running → now stopped)
+		var fallen []string
+		for _, svc := range msg {
+			wasRunning := m.prevServiceStates[svc.Name]
+			nowRunning := svc.IsRunning()
+			if wasRunning && !nowRunning {
+				fallen = append(fallen, svc.Name)
+			}
+			m.prevServiceStates[svc.Name] = nowRunning
+		}
 		// Track which profile has running containers
 		hasRunning := false
 		for _, svc := range msg {
@@ -169,6 +197,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.activeProfiles[m.selectedProfile] = true
 		} else {
 			delete(m.activeProfiles, m.selectedProfile)
+		}
+		if len(fallen) > 0 {
+			m.errStr = fmt.Sprintf("Container stopped: %s", strings.Join(fallen, ", "))
+			return m, scheduleClearStatus()
 		}
 		return m, nil
 
@@ -199,6 +231,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = ""
 		m.errStr = ""
 		return m, nil
+
+	case startupScanMsg:
+		for idx, active := range msg.active {
+			if active {
+				m.activeProfiles[idx] = true
+			}
+		}
+		return m, nil
+
+	case confirmMsg:
+		m.confirmQuestion = msg.question
+		m.confirmAction = msg.action
+		return m, nil
+
+	case downAllMsg:
+		m.activeProfiles = make(map[int]bool)
+		m.status = fmt.Sprintf("Stopped %d profiles", msg.count)
+		m.errStr = ""
+		return m, tea.Batch(m.refreshServices(), scheduleClearStatus())
 
 	case autoRefreshMsg:
 		return m, tea.Batch(m.refreshServices(), scheduleAutoRefresh())
@@ -236,6 +287,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.waitForLogLine()
 
+	case helpMsg:
+		m.helpContent = msg.content
+		m.mode = viewHelp
+		return m, nil
+
 	case logDoneMsg:
 		return m, nil
 	}
@@ -255,6 +311,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateMain(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Handle confirmation dialog
+	if m.confirmQuestion != "" {
+		if kmsg, ok := msg.(tea.KeyMsg); ok {
+			switch kmsg.String() {
+			case "y", "Y":
+				action := m.confirmAction
+				m.confirmQuestion = ""
+				m.confirmAction = nil
+				return m, action
+			default:
+				m.confirmQuestion = ""
+				m.confirmAction = nil
+				m.status = "Cancelled"
+				return m, scheduleClearStatus()
+			}
+		}
+		return m, nil
+	}
+
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch {
@@ -305,7 +380,7 @@ func (m Model) updateMain(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.execUp(nil)
 
 		case key.Matches(msg, keys.DocDown):
-			return m, m.execDown()
+			return m, m.confirmThen("Stop all services in this profile?", m.execDown())
 
 		case key.Matches(msg, keys.Restart):
 			if m.focus == 1 && m.serviceCursor < len(m.services) {
@@ -320,6 +395,10 @@ func (m Model) updateMain(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.startLogs(svc)
 			}
 			return m, nil
+
+		case key.Matches(msg, keys.Refresh):
+			m.status = "Refreshing..."
+			return m, tea.Batch(m.refreshServices(), m.scanAllProfiles())
 
 		case key.Matches(msg, keys.Rebuild):
 			if m.focus == 1 && m.serviceCursor < len(m.services) {
@@ -527,10 +606,11 @@ func (m Model) hasNextLevel(val string) bool {
 
 // completions returns suggestions for the current launcher input.
 func (m Model) completions(input string) []string {
+	hasTrailingSpace := strings.HasSuffix(input, " ")
 	input = strings.TrimSpace(input)
 	parts := strings.Fields(input)
 
-	commands := []string{"up", "down", "restart", "rebuild", "pull", "logs"}
+	commands := []string{"up", "down", "down all", "restart", "rebuild", "pull", "logs"}
 	if !m.hasConfig {
 		commands = append(commands, "init")
 	}
@@ -545,7 +625,7 @@ func (m Model) completions(input string) []string {
 	}
 
 	// Typing first word — filter commands by prefix
-	if len(parts) == 1 && !strings.HasSuffix(input, " ") {
+	if len(parts) == 1 && !hasTrailingSpace {
 		prefix := parts[0]
 		var matches []string
 		for _, cmd := range commands {
@@ -561,7 +641,7 @@ func (m Model) completions(input string) []string {
 	switch cmd {
 	case "up", "restart", "rebuild", "pull", "logs":
 		var prefix string
-		if len(parts) > 1 && !strings.HasSuffix(input, " ") {
+		if len(parts) > 1 && !hasTrailingSpace {
 			prefix = parts[len(parts)-1]
 		}
 
@@ -579,14 +659,14 @@ func (m Model) completions(input string) []string {
 
 	case "config":
 		subcommands := []string{"add", "rm"}
-		if len(parts) == 1 && strings.HasSuffix(input, " ") {
+		if len(parts) == 1 && hasTrailingSpace {
 			var matches []string
 			for _, sc := range subcommands {
 				matches = append(matches, "config "+sc)
 			}
 			return matches
 		}
-		if len(parts) == 2 && !strings.HasSuffix(input, " ") {
+		if len(parts) == 2 && !hasTrailingSpace {
 			prefix := parts[1]
 			var matches []string
 			for _, sc := range subcommands {
@@ -599,7 +679,7 @@ func (m Model) completions(input string) []string {
 		// After "config rm " — suggest existing profile names
 		if len(parts) >= 2 && parts[1] == "rm" {
 			var prefix string
-			if len(parts) > 2 && !strings.HasSuffix(input, " ") {
+			if len(parts) > 2 && !hasTrailingSpace {
 				prefix = parts[len(parts)-1]
 			}
 			var matches []string
@@ -614,7 +694,7 @@ func (m Model) completions(input string) []string {
 		if len(parts) >= 3 && parts[1] == "add" {
 			base := strings.Join(parts[:3], " ")
 			// Already have files listed — suggest more
-			if strings.HasSuffix(input, " ") {
+			if hasTrailingSpace {
 				base = input
 			}
 			files := m.discoverComposeFiles()
@@ -634,7 +714,7 @@ func (m Model) completions(input string) []string {
 	case "help":
 		topics := []string{"config", "up", "down", "restart", "rebuild", "pull", "logs", "edit", "init"}
 		var prefix string
-		if len(parts) > 1 && !strings.HasSuffix(input, " ") {
+		if len(parts) > 1 && !hasTrailingSpace {
 			prefix = parts[1]
 		}
 		var matches []string
@@ -748,12 +828,15 @@ func (m Model) execUp(services []string) tea.Cmd {
 
 	selected := m.selectedProfile
 
-	return func() tea.Msg {
-		if err := docker.Up(context.Background(), *opts, svcs); err != nil {
-			return errMsg{err}
-		}
-		return activeProfileMsg{idx: selected, active: true, status: "Services started"}
-	}
+	return tea.Sequence(
+		func() tea.Msg { return statusMsg("Starting services...") },
+		func() tea.Msg {
+			if err := docker.Up(context.Background(), *opts, svcs); err != nil {
+				return errMsg{err}
+			}
+			return activeProfileMsg{idx: selected, active: true, status: "Services started"}
+		},
+	)
 }
 
 func (m Model) execDown() tea.Cmd {
@@ -762,12 +845,15 @@ func (m Model) execDown() tea.Cmd {
 		return nil
 	}
 	selected := m.selectedProfile
-	return func() tea.Msg {
-		if err := docker.Down(context.Background(), *opts); err != nil {
-			return errMsg{err}
-		}
-		return activeProfileMsg{idx: selected, active: false, status: "Services stopped"}
-	}
+	return tea.Sequence(
+		func() tea.Msg { return statusMsg("Stopping services...") },
+		func() tea.Msg {
+			if err := docker.Down(context.Background(), *opts); err != nil {
+				return errMsg{err}
+			}
+			return activeProfileMsg{idx: selected, active: false, status: "Services stopped"}
+		},
+	)
 }
 
 func (m Model) execRestart(services []string) tea.Cmd {
@@ -775,16 +861,19 @@ func (m Model) execRestart(services []string) tea.Cmd {
 	if opts == nil {
 		return nil
 	}
-	return func() tea.Msg {
-		if err := docker.Restart(context.Background(), *opts, services); err != nil {
-			return errMsg{err}
-		}
-		name := "all"
-		if len(services) > 0 {
-			name = strings.Join(services, ", ")
-		}
-		return statusMsg(fmt.Sprintf("Restarted: %s", name))
+	name := "all"
+	if len(services) > 0 {
+		name = strings.Join(services, ", ")
 	}
+	return tea.Sequence(
+		func() tea.Msg { return statusMsg(fmt.Sprintf("Restarting %s...", name)) },
+		func() tea.Msg {
+			if err := docker.Restart(context.Background(), *opts, services); err != nil {
+				return errMsg{err}
+			}
+			return statusMsg(fmt.Sprintf("Restarted: %s", name))
+		},
+	)
 }
 
 func (m Model) execRebuild(services []string) tea.Cmd {
@@ -793,16 +882,92 @@ func (m Model) execRebuild(services []string) tea.Cmd {
 		return nil
 	}
 	selected := m.selectedProfile
-	return func() tea.Msg {
-		if err := docker.Rebuild(context.Background(), *opts, services); err != nil {
-			return errMsg{err}
-		}
-		name := "all"
-		if len(services) > 0 {
-			name = strings.Join(services, ", ")
-		}
-		return activeProfileMsg{idx: selected, active: true, status: fmt.Sprintf("Rebuilt: %s", name)}
+	name := "all"
+	if len(services) > 0 {
+		name = strings.Join(services, ", ")
 	}
+	return tea.Sequence(
+		func() tea.Msg { return statusMsg(fmt.Sprintf("Rebuilding %s...", name)) },
+		func() tea.Msg {
+			if err := docker.Rebuild(context.Background(), *opts, services); err != nil {
+				return errMsg{err}
+			}
+			return activeProfileMsg{idx: selected, active: true, status: fmt.Sprintf("Rebuilt: %s", name)}
+		},
+	)
+}
+
+func (m Model) confirmThen(question string, action tea.Cmd) tea.Cmd {
+	return func() tea.Msg {
+		return confirmMsg{question: question, action: action}
+	}
+}
+
+func (m Model) scanAllProfiles() tea.Cmd {
+	profiles := make([]struct {
+		idx  int
+		opts docker.ComposeOpts
+	}, 0, len(m.profiles))
+	for i := range m.profiles {
+		opts := m.composeOptsFor(i)
+		if opts != nil {
+			profiles = append(profiles, struct {
+				idx  int
+				opts docker.ComposeOpts
+			}{i, *opts})
+		}
+	}
+	return func() tea.Msg {
+		active := make(map[int]bool)
+		for _, p := range profiles {
+			svcs, err := docker.PS(context.Background(), p.opts)
+			if err != nil {
+				continue
+			}
+			for _, svc := range svcs {
+				if svc.IsRunning() {
+					active[p.idx] = true
+					break
+				}
+			}
+		}
+		return startupScanMsg{active: active}
+	}
+}
+
+func (m Model) execDownAll() tea.Cmd {
+	var allOpts []struct {
+		idx  int
+		opts docker.ComposeOpts
+	}
+	for idx := range m.activeProfiles {
+		opts := m.composeOptsFor(idx)
+		if opts != nil {
+			allOpts = append(allOpts, struct {
+				idx  int
+				opts docker.ComposeOpts
+			}{idx, *opts})
+		}
+	}
+	if len(allOpts) == 0 {
+		return func() tea.Msg { return statusMsg("No running profiles") }
+	}
+	count := len(allOpts)
+	return tea.Sequence(
+		func() tea.Msg { return statusMsg(fmt.Sprintf("Stopping %d profiles...", count)) },
+		func() tea.Msg {
+			var errors []string
+			for _, p := range allOpts {
+				if err := docker.Down(context.Background(), p.opts); err != nil {
+					errors = append(errors, fmt.Sprintf("%s: %v", p.opts.Project, err))
+				}
+			}
+			if len(errors) > 0 {
+				return errMsg{fmt.Errorf("%s", strings.Join(errors, "; "))}
+			}
+			return downAllMsg{count: count}
+		},
+	)
 }
 
 func (m Model) execPull(services []string) tea.Cmd {
@@ -810,12 +975,15 @@ func (m Model) execPull(services []string) tea.Cmd {
 	if opts == nil {
 		return nil
 	}
-	return func() tea.Msg {
-		if err := docker.Pull(context.Background(), *opts, services); err != nil {
-			return errMsg{err}
-		}
-		return statusMsg("Images pulled")
-	}
+	return tea.Sequence(
+		func() tea.Msg { return statusMsg("Pulling images...") },
+		func() tea.Msg {
+			if err := docker.Pull(context.Background(), *opts, services); err != nil {
+				return errMsg{err}
+			}
+			return statusMsg("Images pulled")
+		},
+	)
 }
 
 func (m Model) execInit() tea.Cmd {
@@ -839,6 +1007,7 @@ var helpTopics = map[string]string{
 	"": `Commands:
   up [service]                  Start services (all or specific)
   down                          Stop and remove all services
+  down all                      Stop ALL running profiles at once
   restart [service]             Restart services (all or specific)
   rebuild [service]             Rebuild images and recreate containers
   pull [service]                Pull latest images
@@ -896,7 +1065,10 @@ Fields:
 
 	"down": `down
   Stop and remove all containers for the active profile.
-  Runs: docker compose -f <files> down`,
+  Runs: docker compose -f <files> down
+
+  down all
+  Stop ALL running profiles at once.`,
 
 	"restart": `restart [service...]
   Restart services in the active profile.
@@ -934,7 +1106,11 @@ Fields:
   Will not overwrite an existing config.`,
 }
 
-func (m *Model) execHelp(args []string) tea.Cmd {
+type helpMsg struct {
+	content string
+}
+
+func (m Model) execHelp(args []string) tea.Cmd {
 	topic := ""
 	if len(args) > 0 {
 		topic = args[0]
@@ -947,9 +1123,9 @@ func (m *Model) execHelp(args []string) tea.Cmd {
 		}
 	}
 
-	m.helpContent = text
-	m.mode = viewHelp
-	return nil
+	return func() tea.Msg {
+		return helpMsg{content: text}
+	}
 }
 
 func (m Model) reloadConfig() tea.Cmd {
@@ -1193,7 +1369,13 @@ func (m Model) execLauncherCmd(input string) tea.Cmd {
 	case "up":
 		return m.execUp(args)
 	case "down":
-		return m.execDown()
+		if len(args) > 0 && args[0] == "all" {
+			return m.confirmThen(
+				fmt.Sprintf("Stop all %d running profiles?", len(m.activeProfiles)),
+				m.execDownAll(),
+			)
+		}
+		return m.confirmThen("Stop all services in this profile?", m.execDown())
 	case "restart":
 		return m.execRestart(args)
 	case "rebuild":
@@ -1255,22 +1437,26 @@ func (m Model) viewMain() string {
 
 func (m Model) viewMainWithLauncher() string {
 	var footer strings.Builder
-	footer.WriteString(m.launcher.View())
 
+	// Suggestions above the input line
 	if len(m.suggestions) > 0 {
-		footer.WriteString("\n")
-		for i, s := range m.suggestions {
-			if i >= 5 { // show max 5 suggestions
-				break
-			}
+		footer.WriteString(faintStyle.Render("  tab complete") + "\n")
+		count := len(m.suggestions)
+		if count > 5 {
+			count = 5
+		}
+		for i := count - 1; i >= 0; i-- {
+			s := m.suggestions[i]
 			if i == m.suggIdx {
 				footer.WriteString(accentStyle.Render("  "+s) + "\n")
 			} else {
 				footer.WriteString(faintStyle.Render("  "+s) + "\n")
 			}
 		}
-		footer.WriteString(faintStyle.Render("  tab complete"))
 	}
+
+	// Input line at the bottom
+	footer.WriteString(m.launcher.View())
 
 	return m.renderMain(footer.String())
 }
@@ -1278,6 +1464,13 @@ func (m Model) viewMainWithLauncher() string {
 func (m Model) renderMain(footer string) string {
 	// Header
 	header := titleStyle.Render("devctl") + "  " + subtitleStyle.Render(m.cfg.Project)
+
+	// Count fixed lines: header(1) + blank(1) + status(1) + help(1) = 4
+	fixedLines := 4
+	footerLines := 0
+	if footer != "" {
+		footerLines = strings.Count(footer, "\n") + 1
+	}
 
 	// Two-column body
 	leftWidth := m.width * 40 / 100
@@ -1289,7 +1482,7 @@ func (m Model) renderMain(footer string) string {
 		rightWidth = 30
 	}
 
-	bodyHeight := m.height - 4 // header + status + help + padding
+	bodyHeight := m.height - fixedLines - footerLines
 	if bodyHeight < 10 {
 		bodyHeight = 10
 	}
@@ -1313,7 +1506,7 @@ func (m Model) renderMain(footer string) string {
 	// Help bar — context-aware
 	helpBar := m.renderHelp()
 
-	// Footer (launcher input)
+	// Assemble: header, blank, body, status, [footer], help
 	parts := []string{header, "", body, statusBar}
 	if footer != "" {
 		parts = append(parts, footer)
@@ -1405,10 +1598,21 @@ func (m Model) renderServices(width, height int) string {
 		for i, svc := range m.services {
 			isCursor := i == m.serviceCursor && m.focus == 1
 
-			// Status indicator
+			// Status indicator with health
 			var indicator string
 			if svc.IsRunning() {
-				indicator = statusOKStyle.Render("●")
+				if svc.HasHealthCheck() {
+					switch strings.ToLower(svc.Health) {
+					case "healthy":
+						indicator = statusOKStyle.Render("●")
+					case "unhealthy":
+						indicator = statusErrStyle.Render("●")
+					default: // "starting"
+						indicator = statusWarnStyle.Render("●")
+					}
+				} else {
+					indicator = statusOKStyle.Render("●")
+				}
 			} else {
 				indicator = statusErrStyle.Render("●")
 			}
@@ -1417,13 +1621,17 @@ func (m Model) renderServices(width, height int) string {
 			name := svc.Name
 			padded := name + strings.Repeat(" ", maxName-len(name))
 
-			// Extra info
+			// Extra info: ports + health + runtime
 			var extra string
-			if svc.Ports != "" {
-				extra += "  " + faintStyle.Render(svc.Ports)
+			ports := formatPorts(svc.Ports)
+			if ports != "" {
+				extra += "  " + faintStyle.Render(ports)
+			}
+			if svc.HasHealthCheck() && svc.IsRunning() {
+				extra += "  " + m.healthStyle(svc.Health)
 			}
 			if svc.RunTime != "" {
-				extra += "  " + faintStyle.Render(svc.RunTime)
+				extra += "  " + statusWarnStyle.Render(svc.RunTime)
 			}
 
 			if isCursor {
@@ -1450,6 +1658,11 @@ func (m Model) renderServices(width, height int) string {
 }
 
 func (m Model) renderStatus() string {
+	if m.confirmQuestion != "" {
+		return statusWarnStyle.Render(m.confirmQuestion+" ") +
+			helpKeyStyle.Render("[y]") + faintStyle.Render(" confirm  ") +
+			helpKeyStyle.Render("[any]") + faintStyle.Render(" cancel")
+	}
 	if m.errStr != "" {
 		return errorMsgStyle.Render("Error: " + m.errStr)
 	}
@@ -1457,6 +1670,55 @@ func (m Model) renderStatus() string {
 		return successMsgStyle.Render(m.status)
 	}
 	return ""
+}
+
+// healthStyle renders health status with appropriate color.
+func (m Model) healthStyle(health string) string {
+	switch strings.ToLower(health) {
+	case "healthy":
+		return statusOKStyle.Render("healthy")
+	case "unhealthy":
+		return statusErrStyle.Render("unhealthy")
+	case "starting":
+		return statusWarnStyle.Render("starting")
+	default:
+		return faintStyle.Render(health)
+	}
+}
+
+// formatPorts extracts meaningful port mappings from docker's verbose format.
+// Input:  "0.0.0.0:5432->5432/tcp, 0.0.0.0:8080->80/tcp"
+// Output: ":5432 :8080->80"
+func formatPorts(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, ", ")
+	var result []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		// Extract "host:port->container/proto" pattern
+		if idx := strings.Index(part, "->"); idx >= 0 {
+			hostPart := part[:idx]
+			containerPart := part[idx+2:]
+			// Get host port (after last ":")
+			hostPort := hostPart
+			if ci := strings.LastIndex(hostPart, ":"); ci >= 0 {
+				hostPort = hostPart[ci:]
+			}
+			// Get container port (strip protocol)
+			containerPort := strings.Split(containerPart, "/")[0]
+			if hostPort == ":"+containerPort {
+				result = append(result, hostPort)
+			} else {
+				result = append(result, hostPort+"->"+containerPort)
+			}
+		}
+	}
+	if len(result) == 0 {
+		return ""
+	}
+	return strings.Join(result, " ")
 }
 
 func (m Model) renderHelp() string {
@@ -1471,6 +1733,7 @@ func (m Model) renderHelp() string {
 			{"e", "edit"},
 			{"u", "up"},
 			{"d", "down"},
+			{"R", "refresh"},
 			{"tab", "services"},
 			{":", "command"},
 			{"q", "quit"},
@@ -1484,7 +1747,7 @@ func (m Model) renderHelp() string {
 			{"l", "logs"},
 			{"u", "up"},
 			{"d", "down"},
-			{"c", "create"},
+			{"R", "refresh"},
 			{"tab", "profiles"},
 			{":", "command"},
 			{"q", "quit"},

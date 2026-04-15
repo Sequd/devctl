@@ -28,5 +28,12 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+
+# Claude Code
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store

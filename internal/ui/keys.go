@@ -11,6 +11,7 @@ type keyMap struct {
 	DocDown key.Binding // docker down
 	Restart key.Binding
 	Rebuild key.Binding
+	Refresh key.Binding
 	Logs    key.Binding
 	Command key.Binding
 	Create  key.Binding
@@ -27,6 +28,7 @@ var keys = keyMap{
 	DocDown: key.NewBinding(key.WithKeys("d")),
 	Restart: key.NewBinding(key.WithKeys("r")),
 	Rebuild: key.NewBinding(key.WithKeys("b")),
+	Refresh: key.NewBinding(key.WithKeys("R")),
 	Logs:    key.NewBinding(key.WithKeys("l")),
 	Command: key.NewBinding(key.WithKeys(":")),
 	Create:  key.NewBinding(key.WithKeys("c")),
